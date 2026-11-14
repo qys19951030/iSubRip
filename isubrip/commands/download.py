@@ -7,8 +7,16 @@ from rich.console import Group
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.text import Text
 
+from isubrip.catalog import (
+    CatalogRecorder,
+    CatalogRunStats,
+    SubtitlesCatalog,
+    utc_now_iso,
+)
 from isubrip.cli import conditional_live, console
 from isubrip.data_structures import (
+    CatalogRunRecord,
+    CatalogRunStatus,
     Episode,
     MediaData,
     Movie,
@@ -37,7 +45,9 @@ async def download(*urls: str,
                    language_filter: list[str] | None = None,
                    convert_to_srt: bool = False,
                    overwrite_existing: bool = True,
-                   zip: bool = False) -> bool:
+                   zip: bool = False,
+                   catalog_path: Path | None = None,
+                   only_missing: bool = False) -> bool:
     """
     Download subtitles from given URLs.
 
@@ -49,79 +59,153 @@ async def download(*urls: str,
         convert_to_srt (bool, optional): Whether to convert the subtitles to SRT format. Defaults to False.
         overwrite_existing (bool, optional): Whether to overwrite existing subtitles. Defaults to True.
         zip (bool, optional): Whether to zip multiple subtitles. Defaults to False.
+        catalog_path (Path | None, optional): Path to a subtitles catalog database file for recording
+            download results. None to disable cataloging. Defaults to None.
+        only_missing (bool, optional): Whether to only download subtitles that are not already
+            recorded in the catalog. Requires `catalog_path`. Defaults to False.
     """
     any_url_succeeded = False
+    catalog: SubtitlesCatalog | None = None
+    run_id: str | None = None
+    run_stats = CatalogRunStats()
+    run_started_at = utc_now_iso()
+    run_status: CatalogRunStatus = "success"
 
-    for url in urls:
-        url_succeeded = False
-        safe_url = redact_url_query_param(url=url, key="dsid")
+    if catalog_path is not None:
+        catalog = SubtitlesCatalog(db_path=catalog_path)
+        run_id = catalog.generate_run_id()
 
-        try:
-            logger.info(f"Scraping [blue]{safe_url}[/blue]")
-
-            scraper = ScraperFactory.get_scraper_instance(url=url)
+    try:
+        for url in urls:
+            url_succeeded = False
+            safe_url = redact_url_query_param(url=url, key="dsid")
+            recorder = (
+                CatalogRecorder(
+                    catalog=catalog,
+                    run_id=run_id,
+                    source_url=url,
+                    download_path=download_path,
+                    stats=run_stats,
+                    only_missing=only_missing,
+                )
+                if catalog is not None and run_id is not None
+                else None
+            )
 
             try:
-                logger.debug(f"Fetching {safe_url}")
-                scraper_response: ScrapedMediaResponse = await scraper.get_data(url=url)
+                logger.info(f"Scraping [blue]{safe_url}[/blue]")
 
-            except ScraperError as e:
-                safe_error = redact_url_query_param(url=str(e), key="dsid")
-                logger.error(f"Error: {safe_error}")
-                logger.debug(f"Exception type: {type(e).__name__}")
-                continue
+                scraper = ScraperFactory.get_scraper_instance(url=url)
 
-            media_data = scraper_response.media_data
-            playlist_scraper = ScraperFactory.get_scraper_instance(scraper_id=scraper_response.playlist_scraper)
-
-            if not isinstance(playlist_scraper, HLSScraper):
-                logger.error(f"Error: '{scraper_response.playlist_scraper}' is not an HLS playlist scraper.")
-                continue
-
-            if not media_data:
-                logger.error(f"Error: No supported media was found for {safe_url}.")
-                continue
-
-            for media_item in media_data:
                 try:
-                    logger.info(f"Found {media_item.media_type}: "
-                                f"[cyan]{format_media_description(media_data=media_item)}[/cyan]")
-                    media_item_succeeded = await download_media(
-                        scraper=playlist_scraper,
-                        media_item=media_item,
-                        download_path=download_path,
-                        language_filter=language_filter,
-                        convert_to_srt=convert_to_srt,
-                        overwrite_existing=overwrite_existing,
-                        zip=zip,
-                    )
-                    url_succeeded = media_item_succeeded or url_succeeded
+                    logger.debug(f"Fetching {safe_url}")
+                    scraper_response: ScrapedMediaResponse = await scraper.get_data(url=url)
 
-                except Exception as e:
-                    if len(media_data) > 1:
-                        safe_error = redact_url_query_param(url=str(e), key="dsid")
-                        logger.warning(f"Error scraping media item "
-                                    f"'{format_media_description(media_data=media_item)}': {safe_error}\n"
-                                    f"Skipping to next media item...")
-                        logger.debug(f"Exception type: {type(e).__name__}")
-                        continue
+                except ScraperError as e:
+                    safe_error = redact_url_query_param(url=str(e), key="dsid")
+                    logger.error(f"Error: {safe_error}")
+                    logger.debug(f"Exception type: {type(e).__name__}")
 
-                    raise
+                    if recorder:
+                        recorder.add_failures()
 
-        except Exception as e:
-            safe_error = redact_url_query_param(url=str(e), key="dsid")
-            logger.error(f"Error while scraping '{safe_url}': {safe_error}")
-            logger.debug(f"Exception type: {type(e).__name__}")
+                    continue
 
-        finally:
-            any_url_succeeded = url_succeeded or any_url_succeeded
+                media_data = scraper_response.media_data
+                playlist_scraper = ScraperFactory.get_scraper_instance(scraper_id=scraper_response.playlist_scraper)
+
+                if not isinstance(playlist_scraper, HLSScraper):
+                    logger.error(f"Error: '{scraper_response.playlist_scraper}' is not an HLS playlist scraper.")
+
+                    if recorder:
+                        recorder.add_failures()
+
+                    continue
+
+                if not media_data:
+                    logger.error(f"Error: No supported media was found for {safe_url}.")
+
+                    if recorder:
+                        recorder.add_failures()
+
+                    continue
+
+                for media_item in media_data:
+                    try:
+                        logger.info(f"Found {media_item.media_type}: "
+                                    f"[cyan]{format_media_description(media_data=media_item)}[/cyan]")
+                        media_item_succeeded = await download_media(
+                            scraper=playlist_scraper,
+                            media_item=media_item,
+                            download_path=download_path,
+                            language_filter=language_filter,
+                            convert_to_srt=convert_to_srt,
+                            overwrite_existing=overwrite_existing,
+                            zip=zip,
+                            catalog_recorder=recorder,
+                        )
+                        url_succeeded = media_item_succeeded or url_succeeded
+
+                    except Exception as e:
+                        if len(media_data) > 1:
+                            if recorder:
+                                recorder.add_failures()
+
+                            safe_error = redact_url_query_param(url=str(e), key="dsid")
+                            logger.warning(f"Error scraping media item "
+                                        f"'{format_media_description(media_data=media_item)}': {safe_error}\n"
+                                        f"Skipping to next media item...")
+                            logger.debug(f"Exception type: {type(e).__name__}")
+                            continue
+
+                        raise
+
+            except Exception as e:
+                if recorder:
+                    recorder.add_failures()
+
+                safe_error = redact_url_query_param(url=str(e), key="dsid")
+                logger.error(f"Error while scraping '{safe_url}': {safe_error}")
+                logger.debug(f"Exception type: {type(e).__name__}")
+
+            finally:
+                any_url_succeeded = url_succeeded or any_url_succeeded
+
+    except BaseException:
+        run_status = "failed"
+        raise
+
+    finally:
+        if catalog is not None and run_id is not None:
+            if run_status != "failed" and run_stats.failed > 0:
+                run_status = "partial" if (run_stats.added + run_stats.updated) > 0 else "failed"
+
+            try:
+                catalog.finish_run(
+                    record=CatalogRunRecord(
+                        run_id=run_id,
+                        started_at=run_started_at,
+                        finished_at=utc_now_iso(),
+                        status=run_status,
+                        added_count=run_stats.added,
+                        updated_count=run_stats.updated,
+                        failed_count=run_stats.failed,
+                    ),
+                )
+
+            except Exception as e:
+                logger.warning(f"Failed to record the run in the subtitles catalog: {e}")
+                logger.debug("Debug information:", exc_info=True)
+
+            catalog.close()
 
     return any_url_succeeded
 
 
 async def download_media(scraper: HLSScraper, media_item: MediaData, download_path: Path,
                               language_filter: list[str] | None = None, convert_to_srt: bool = False,
-                              overwrite_existing: bool = True, zip: bool = False) -> bool:
+                              overwrite_existing: bool = True, zip: bool = False,
+                              catalog_recorder: CatalogRecorder | None = None) -> bool:
     """
     Download a media item.
 
@@ -134,6 +218,8 @@ async def download_media(scraper: HLSScraper, media_item: MediaData, download_pa
         convert_to_srt (bool, optional): Whether to convert the subtitles to SRT format. Defaults to False.
         overwrite_existing (bool, optional): Whether to overwrite existing subtitles. Defaults to True.
         zip (bool, optional): Whether to zip multiple subtitles. Defaults to False.
+        catalog_recorder (CatalogRecorder | None, optional): A recorder for logging results
+            into a subtitles catalog. Defaults to None.
     """
     if isinstance(media_item, Series):
         results: list[bool] = []
@@ -141,7 +227,8 @@ async def download_media(scraper: HLSScraper, media_item: MediaData, download_pa
         for season in media_item.seasons:
             results.append(await download_media(media_item=season, scraper=scraper, download_path=download_path,
                                                 language_filter=language_filter, convert_to_srt=convert_to_srt,
-                                                overwrite_existing=overwrite_existing, zip=zip))
+                                                overwrite_existing=overwrite_existing, zip=zip,
+                                                catalog_recorder=catalog_recorder))
 
         return any(results)
 
@@ -152,21 +239,24 @@ async def download_media(scraper: HLSScraper, media_item: MediaData, download_pa
             logger.info(f"{format_media_description(media_data=episode, shortened=True)}:")
             results.append(await download_media_item(media_item=episode, scraper=scraper, download_path=download_path,
                                                      language_filter=language_filter, convert_to_srt=convert_to_srt,
-                                                     overwrite_existing=overwrite_existing, zip=zip))
+                                                     overwrite_existing=overwrite_existing, zip=zip,
+                                                     catalog_recorder=catalog_recorder))
 
         return any(results)
 
     if isinstance(media_item, (Movie | Episode)):
         return await download_media_item(media_item=media_item, scraper=scraper, download_path=download_path,
                                          language_filter=language_filter, convert_to_srt=convert_to_srt,
-                                         overwrite_existing=overwrite_existing, zip=zip)
+                                         overwrite_existing=overwrite_existing, zip=zip,
+                                         catalog_recorder=catalog_recorder)
 
     return False
 
 
 async def download_media_item(scraper: HLSScraper, media_item: Movie | Episode, download_path: Path,
                               language_filter: list[str] | None = None, convert_to_srt: bool = False,
-                              overwrite_existing: bool = True, zip: bool = False) -> bool:
+                              overwrite_existing: bool = True, zip: bool = False,
+                              catalog_recorder: CatalogRecorder | None = None) -> bool:
     """
     Download subtitles for a single media item.
 
@@ -179,6 +269,8 @@ async def download_media_item(scraper: HLSScraper, media_item: Movie | Episode, 
         convert_to_srt (bool, optional): Whether to convert the subtitles to SRT format. Defaults to False.
         overwrite_existing (bool, optional): Whether to overwrite existing subtitles. Defaults to True.
         zip (bool, optional): Whether to zip multiple subtitles. Defaults to False.
+        catalog_recorder (CatalogRecorder | None, optional): A recorder for logging results
+            into a subtitles catalog. Defaults to None.
     """
     ex: Exception | None = None
 
@@ -192,6 +284,7 @@ async def download_media_item(scraper: HLSScraper, media_item: Movie | Episode, 
                 convert_to_srt=convert_to_srt,
                 overwrite_existing=overwrite_existing,
                 zip=zip,
+                catalog_recorder=catalog_recorder,
             )
 
             success_count = len(results.successful_subtitles)
@@ -219,9 +312,15 @@ async def download_media_item(scraper: HLSScraper, media_item: Movie | Episode, 
         )
 
     if ex:
+        if catalog_recorder:
+            catalog_recorder.add_failures()
+
         logger.error(f"Error: {redact_url_query_param(url=str(ex), key='dsid')}")
 
     elif not has_future_rental_date:
+        if catalog_recorder:
+            catalog_recorder.add_failures()
+
         logger.error("Error: No valid playlist was found.")
 
     return False
@@ -229,7 +328,8 @@ async def download_media_item(scraper: HLSScraper, media_item: Movie | Episode, 
 
 async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, download_path: Path,
                              language_filter: list[str] | None = None, convert_to_srt: bool = False,
-                             overwrite_existing: bool = True, zip: bool = False) -> SubtitlesDownloadResults:
+                             overwrite_existing: bool = True, zip: bool = False,
+                             catalog_recorder: CatalogRecorder | None = None) -> SubtitlesDownloadResults:
     """
     Download subtitles for the given media data.
 
@@ -242,6 +342,8 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
         convert_to_srt (bool, optional): Whether to convert the subtitles to SRT format. Defaults to False.
         overwrite_existing (bool, optional): Whether to overwrite existing subtitles. Defaults to True.
         zip (bool, optional): Whether to zip multiple subtitles. Defaults to False.
+        catalog_recorder (CatalogRecorder | None, optional): A recorder for logging results
+            into a subtitles catalog. Defaults to None.
 
     Returns:
         SubtitlesDownloadResults: A SubtitlesDownloadResults object containing the results of the download.
@@ -256,6 +358,7 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
     )
     successful_downloads: list[SubtitlesData] = []
     failed_downloads: list[SubtitlesDownloadError] = []
+    saved_files: list[tuple[SubtitlesData, Path]] = []
 
     with TemporaryDirectory(directory_name=temp_dir_name) as temp_download_path:
         temp_downloads: list[Path] = []
@@ -269,6 +372,20 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
             main_playlist=main_playlist,
             language_filter=language_filter,
         )
+
+        if catalog_recorder is not None and catalog_recorder.only_missing and matching_subtitle_groups:
+            total_groups_count = len(matching_subtitle_groups)
+            matching_subtitle_groups = catalog_recorder.filter_missing_groups(
+                scraper=scraper,
+                media_data=media_data,
+                groups=matching_subtitle_groups,
+            )
+            skipped_groups_count = total_groups_count - len(matching_subtitle_groups)
+
+            if skipped_groups_count:
+                logger.info(f"Skipping {skipped_groups_count} subtitles that are already recorded "
+                            f"in the catalog (--only-missing).",
+                            extra={"hide_when_interactive": True})
 
         # If no matching subtitles were found, there's no need to continue
         if not matching_subtitle_groups:
@@ -366,7 +483,7 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
                 progress_bar.update(task, visible=False)
 
         if not zip or len(temp_downloads) == 1:
-            for file_path in temp_downloads:
+            for subtitles_data, file_path in zip(successful_downloads, temp_downloads, strict=True):
                 if overwrite_existing:
                     new_path = download_path / file_path.name
 
@@ -374,6 +491,7 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
                     new_path = generate_non_conflicting_path(file_path=download_path / file_path.name)
 
                 shutil.move(src=file_path, dst=new_path)
+                saved_files.append((subtitles_data, new_path))
 
         elif len(temp_downloads) > 0:
             zip_path = Path(shutil.make_archive(
@@ -399,6 +517,19 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
                 destination_path = generate_non_conflicting_path(file_path=download_path / file_name)
 
             shutil.move(src=zip_path, dst=destination_path)
+            saved_files.extend((subtitles_data, destination_path) for subtitles_data in successful_downloads)
+
+    if catalog_recorder is not None:
+        try:
+            catalog_recorder.record_results(
+                media_data=media_data,
+                saved_files=saved_files,
+                failed_count=len(failed_downloads),
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to record downloaded subtitles in the catalog: {e}")
+            logger.debug("Debug information:", exc_info=True)
 
     return SubtitlesDownloadResults(
         media_data=media_data,

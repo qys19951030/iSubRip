@@ -33,6 +33,7 @@ class DownloadsCategory(ConfigCategory):
     languages: list[str] = Field(default=[])
     overwrite_existing: bool = Field(default=False)
     zip: bool = Field(default=False)
+    catalog: Path | None = Field(default=None)
 
     @field_validator('folder')
     @classmethod

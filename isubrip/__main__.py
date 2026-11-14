@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ from isubrip.cli import console
 from isubrip.commands.download import download
 from isubrip.config import Config
 from isubrip.constants import (
+    DEFAULT_CATALOG_FILE_NAME,
     PACKAGE_NAME,
     PACKAGE_VERSION,
     data_folder_path,
@@ -41,7 +43,6 @@ else:
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
 
 log_rotation_size: int = 15  # Default size, before being updated by the config file.
@@ -53,6 +54,7 @@ class CLIArguments:
 
     urls: list[str]
     dsid: str | None
+    catalog: Path | None
 
 
 def main() -> None:
@@ -112,6 +114,12 @@ async def _main() -> bool:
         check_for_updates(current_package_version=PACKAGE_VERSION)
 
     try:
+        catalog_path = (
+            cli_args.catalog
+            or config.downloads.catalog
+            or (config.downloads.folder / DEFAULT_CATALOG_FILE_NAME)
+        )
+
         download_succeeded = await download(
             *single_string_to_list(item=cli_args.urls),
             download_path=config.downloads.folder,
@@ -119,6 +127,7 @@ async def _main() -> bool:
             convert_to_srt=config.subtitles.convert_to_srt,
             overwrite_existing=config.downloads.overwrite_existing,
             zip=config.downloads.zip,
+            catalog_path=catalog_path,
         )
     
     finally:
@@ -157,13 +166,21 @@ def parse_cli_args(args: Sequence[str] | None = None) -> CLIArguments:
         help="Optional Apple account DSID fallback to use for owned or rented movies.",
     )
     parser.add_argument(
+        "--catalog",
+        metavar="PATH",
+        type=Path,
+        default=None,
+        help="Path to the subtitles catalog database file. "
+             "Defaults to 'subtitles-catalog.db' in the downloads folder.",
+    )
+    parser.add_argument(
         "urls",
         metavar="URL",
         nargs="+",
         help="Apple TV or iTunes movie URL to process.",
     )
     parsed_args = parser.parse_args(args)
-    return CLIArguments(urls=parsed_args.urls, dsid=parsed_args.dsid)
+    return CLIArguments(urls=parsed_args.urls, dsid=parsed_args.dsid, catalog=parsed_args.catalog)
 
 
 def format_cli_command_for_logging(cli_args: CLIArguments) -> str:
@@ -172,6 +189,9 @@ def format_cli_command_for_logging(cli_args: CLIArguments) -> str:
 
     if cli_args.dsid is not None:
         command_parts.extend(("--dsid", "REDACTED"))
+
+    if cli_args.catalog is not None:
+        command_parts.extend(("--catalog", str(cli_args.catalog)))
 
     command_parts.extend(redact_url_query_param(url=url, key="dsid") for url in cli_args.urls)
     return " ".join(command_parts)

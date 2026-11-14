@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import datetime as dt
 import hashlib
 from pathlib import Path
@@ -12,6 +13,9 @@ from isubrip.data_structures import (
     CatalogRunRecord,
     CatalogSubtitlesKind,
     CatalogSubtitlesRecord,
+    Episode,
+    Movie,
+    SubtitlesData,
     SubtitlesType,
 )
 from isubrip.logger import logger
@@ -19,6 +23,9 @@ from isubrip.utils import redact_url_query_param
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from isubrip.data_structures import SubtitleMediaGroup
+    from isubrip.scrapers.scraper import HLSScraper, PlaylistMediaItem
 
 DEFAULT_CATALOG_FILE_NAME = "subtitles-catalog.db"
 
@@ -312,3 +319,144 @@ class SubtitlesCatalog:
             "SELECT * FROM runs WHERE run_id = ?",
             (run_id,),
         ).fetchone()
+
+
+@dataclass
+class CatalogRunStats:
+    """Accumulated subtitles counters for a single download run."""
+    added: int = 0
+    updated: int = 0
+    failed: int = 0
+
+
+class CatalogRecorder:
+    """
+    Records download results for a single source URL into a subtitles catalog,
+    as part of a download run.
+    """
+    def __init__(self, catalog: SubtitlesCatalog, run_id: str, source_url: str,
+                 download_path: str | Path, stats: CatalogRunStats, only_missing: bool = False):
+        """
+        Initialize a CatalogRecorder.
+
+        Args:
+            catalog (SubtitlesCatalog): The catalog to record into.
+            run_id (str): ID of the run the records belong to.
+            source_url (str): Source URL the recorded subtitles were scraped from.
+                Will be normalized and have its DSID redacted.
+            download_path (str | Path): Path to the folder subtitles are downloaded to.
+                Recorded file names are stored relative to this path.
+            stats (CatalogRunStats): Run-level statistics object to accumulate counts into.
+            only_missing (bool, optional): Whether to only download subtitles missing
+                from the catalog. Defaults to False.
+        """
+        self.catalog = catalog
+        self.run_id = run_id
+        self.source_url = normalize_source_url(url=source_url)
+        self.storefront = extract_storefront(url=source_url)
+        self.download_path = Path(download_path)
+        self.only_missing = only_missing
+        self.stats = stats
+
+    def filter_missing_groups(self, scraper: HLSScraper, media_data: Movie | Episode,
+                              groups: list[SubtitleMediaGroup[PlaylistMediaItem]],
+                              ) -> list[SubtitleMediaGroup[PlaylistMediaItem]]:
+        """
+        Filter out subtitle groups that are already recorded in the catalog.
+
+        Args:
+            scraper (HLSScraper): The scraper used for downloading the subtitles.
+            media_data (Movie | Episode): Media data object the subtitles belong to.
+            groups (list[SubtitleMediaGroup]): Subtitle groups to filter.
+
+        Returns:
+            list[SubtitleMediaGroup]: Subtitle groups that are not yet recorded in the catalog.
+        """
+        existing_keys = self.catalog.get_subtitles_keys(
+            source_url=self.source_url,
+            itunes_id=media_data.id or "",
+        )
+        missing_groups = []
+
+        for group in groups:
+            primary = group.primary
+            language_code = (primary.language or "").casefold()
+            kind = subtitles_kind(special_type=scraper.detect_subtitles_type(subtitles_media=primary))
+
+            if (language_code, kind) not in existing_keys:
+                missing_groups.append(group)
+
+        return missing_groups
+
+    def record_results(self, media_data: Movie | Episode,
+                       saved_files: Iterable[tuple[SubtitlesData, Path]],
+                       failed_count: int) -> None:
+        """
+        Record downloaded subtitles files into the catalog, and accumulate run statistics.
+
+        Args:
+            media_data (Movie | Episode): Media data object the subtitles belong to.
+            saved_files (Iterable[tuple[SubtitlesData, Path]]): Downloaded subtitles and their
+                final paths on disk.
+            failed_count (int): Amount of subtitles that failed to download for the media item.
+        """
+        records = [
+            self._build_record(media_data=media_data, subtitles_data=subtitles_data, file_path=file_path)
+            for subtitles_data, file_path in saved_files
+        ]
+        added_count, updated_count = self.catalog.upsert_subtitles(records=records)
+        self.stats.added += added_count
+        self.stats.updated += updated_count
+        self.stats.failed += failed_count
+
+    def add_failures(self, count: int = 1) -> None:
+        """
+        Add to the run's failed items counter.
+
+        Args:
+            count (int, optional): Amount of failures to add. Defaults to 1.
+        """
+        self.stats.failed += count
+
+    def _build_record(self, media_data: Movie | Episode, subtitles_data: SubtitlesData,
+                      file_path: Path) -> CatalogSubtitlesRecord:
+        """Build a catalog record for a single downloaded subtitles file."""
+        try:
+            file_name = file_path.relative_to(self.download_path).as_posix()
+
+        except ValueError:
+            file_name = file_path.name
+
+        return CatalogSubtitlesRecord(
+            run_id=self.run_id,
+            source_url=self.source_url,
+            storefront=self.storefront,
+            itunes_id=media_data.id or "",
+            media_type=media_data.media_type,
+            title=media_data.name if isinstance(media_data, Movie) else media_data.series_name,
+            release_year=self._release_year(media_data=media_data),
+            season_number=media_data.season_number if isinstance(media_data, Episode) else None,
+            episode_number=media_data.episode_number if isinstance(media_data, Episode) else None,
+            language_code=subtitles_data.language_code,
+            language_name=subtitles_data.language_name,
+            subtitles_type=subtitles_kind(special_type=subtitles_data.special_type),
+            format=subtitles_data.subtitles_format.value.file_extension,
+            file_name=file_name,
+            size_bytes=len(subtitles_data.content),
+            sha256=sha256_hexdigest(content=subtitles_data.content),
+            downloaded_at=utc_now_iso(),
+        )
+
+    @staticmethod
+    def _release_year(media_data: Movie | Episode) -> int | None:
+        """Extract the release year of a media item."""
+        release_date = (
+            media_data.release_date
+            if isinstance(media_data, Movie)
+            else (media_data.series_release_date or media_data.release_date)
+        )
+
+        if isinstance(release_date, dt.datetime):
+            return release_date.year
+
+        return release_date

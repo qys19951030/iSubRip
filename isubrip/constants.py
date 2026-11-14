@@ -10,6 +10,7 @@ PACKAGE_VERSION = "2.7.4"
 
 SCRAPER_MODULES_SUFFIX = "_scraper"
 USER_CONFIG_FILE_NAME = "config.toml"
+DEFAULT_CATALOG_FILE_NAME = "subtitles-catalog.db"
 
 @lru_cache(maxsize=1)
 def data_folder_path() -> Path:
