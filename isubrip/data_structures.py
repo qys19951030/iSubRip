@@ -87,6 +87,74 @@ class SubtitlesType(Enum):
     FORCED = "Forced"
 
 
+CatalogSubtitlesKind = Literal["regular", "cc", "forced"]
+CatalogRunStatus = Literal["success", "partial", "failed"]
+
+
+class CatalogSubtitlesRecord(BaseModel):
+    """
+    A record of a single downloaded subtitles file, stored in the subtitles catalog.
+
+    Attributes:
+        run_id (str): ID of the run that downloaded the subtitles.
+        source_url (str): Source URL the media was scraped from (normalized and DSID-redacted).
+        storefront (str | None, optional): Storefront country code of the source URL. Defaults to None.
+        itunes_id (str): iTunes media ID of the media the subtitles belong to (empty string if unknown).
+        media_type (str): Type of the media ("movie" or "episode").
+        title (str): Title of the media (series title for episodes).
+        release_year (int | None, optional): Release year of the media. Defaults to None.
+        season_number (int | None, optional): Season number (episodes only). Defaults to None.
+        episode_number (int | None, optional): Episode number (episodes only). Defaults to None.
+        language_code (str): Language code of the subtitles.
+        language_name (str | None, optional): Language name of the subtitles. Defaults to None.
+        subtitles_type (CatalogSubtitlesKind): Type of the subtitles ("regular", "cc" or "forced").
+        format (str): File format of the subtitles (file extension, e.g. "vtt" or "srt").
+        file_name (str): Name of the subtitles file, relative to the downloads folder.
+        size_bytes (int): Size of the subtitles content in bytes.
+        sha256 (str): SHA-256 hex digest of the subtitles content.
+        downloaded_at (str): Download timestamp (UTC, ISO 8601).
+    """
+    run_id: str
+    source_url: str
+    media_type: str
+    title: str
+    language_code: str
+    subtitles_type: CatalogSubtitlesKind
+    format: str
+    file_name: str
+    size_bytes: int
+    sha256: str
+    downloaded_at: str
+    storefront: str | None = None
+    itunes_id: str = ""
+    release_year: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    language_name: str | None = None
+
+
+class CatalogRunRecord(BaseModel):
+    """
+    A record of a single download run, stored in the subtitles catalog.
+
+    Attributes:
+        run_id (str): ID of the run.
+        started_at (str): Run start timestamp (UTC, ISO 8601).
+        finished_at (str): Run finish timestamp (UTC, ISO 8601).
+        status (CatalogRunStatus): Final status of the run ("success", "partial" or "failed").
+        added_count (int): Amount of subtitles records added to the catalog during the run.
+        updated_count (int): Amount of existing subtitles records updated during the run.
+        failed_count (int): Amount of subtitles (or media items) that failed during the run.
+    """
+    run_id: str
+    started_at: str
+    finished_at: str
+    status: CatalogRunStatus
+    added_count: int = 0
+    updated_count: int = 0
+    failed_count: int = 0
+
+
 class SubtitlesData(BaseModel):
     """
     An object containing subtitles data and metadata.
