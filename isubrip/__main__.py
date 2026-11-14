@@ -13,6 +13,7 @@ import httpx2
 from packaging.version import Version
 from pydantic import ValidationError
 
+from isubrip.catalog import audit_catalog
 from isubrip.cli import console
 from isubrip.commands.download import download
 from isubrip.config import Config
@@ -55,6 +56,10 @@ class CLIArguments:
     urls: list[str]
     dsid: str | None
     catalog: Path | None
+    only_missing: bool
+    batch: Path | None
+    audit: bool
+    languages: list[str] | None
 
 
 def main() -> None:
@@ -113,21 +118,35 @@ async def _main() -> bool:
     if config.general.check_for_updates:
         check_for_updates(current_package_version=PACKAGE_VERSION)
 
-    try:
-        catalog_path = (
-            cli_args.catalog
-            or config.downloads.catalog
-            or (config.downloads.folder / DEFAULT_CATALOG_FILE_NAME)
+    urls = list(cli_args.urls)
+
+    if cli_args.batch is not None:
+        urls = read_batch_urls(batch_file=cli_args.batch)
+
+    language_filter = cli_args.languages if cli_args.languages is not None else config.downloads.languages
+    catalog_path = (
+        cli_args.catalog
+        or config.downloads.catalog
+        or (config.downloads.folder / DEFAULT_CATALOG_FILE_NAME)
+    )
+
+    if cli_args.audit:
+        return audit_catalog(
+            catalog_path=catalog_path,
+            urls=urls,
+            target_languages=language_filter,
         )
 
+    try:
         download_succeeded = await download(
-            *single_string_to_list(item=cli_args.urls),
+            *single_string_to_list(item=urls),
             download_path=config.downloads.folder,
-            language_filter=config.downloads.languages,
+            language_filter=language_filter,
             convert_to_srt=config.subtitles.convert_to_srt,
             overwrite_existing=config.downloads.overwrite_existing,
             zip=config.downloads.zip,
             catalog_path=catalog_path,
+            only_missing=cli_args.only_missing,
         )
     
     finally:
@@ -174,13 +193,102 @@ def parse_cli_args(args: Sequence[str] | None = None) -> CLIArguments:
              "Defaults to 'subtitles-catalog.db' in the downloads folder.",
     )
     parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Only download subtitles that are not already recorded in the catalog.",
+    )
+    parser.add_argument(
+        "--batch",
+        metavar="FILE",
+        type=Path,
+        default=None,
+        help="Path to a file listing Apple TV URLs to process (one per line; "
+             "blank lines and lines starting with '#' are skipped).",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Audit the catalog's coverage of the --batch addresses without downloading anything. "
+             "Exits with code 0 if all target languages are covered, 1 otherwise.",
+    )
+    parser.add_argument(
+        "--languages",
+        metavar="LANG",
+        nargs="+",
+        default=None,
+        help="Target subtitle languages (comma-separated or space-separated). "
+             "Overrides 'downloads.languages' from the config file.",
+    )
+    parser.add_argument(
         "urls",
         metavar="URL",
-        nargs="+",
+        nargs="*",
         help="Apple TV or iTunes movie URL to process.",
     )
     parsed_args = parser.parse_args(args)
-    return CLIArguments(urls=parsed_args.urls, dsid=parsed_args.dsid, catalog=parsed_args.catalog)
+
+    if parsed_args.batch is not None and parsed_args.urls:
+        parser.error("URL arguments cannot be combined with --batch.")
+
+    if parsed_args.batch is None and not parsed_args.urls:
+        parser.error("the following arguments are required: URL")
+
+    if parsed_args.audit and parsed_args.batch is None:
+        parser.error("--audit requires --batch.")
+
+    languages: list[str] | None = None
+
+    if parsed_args.languages is not None:
+        languages = [
+            language_code.strip()
+            for item in parsed_args.languages
+            for language_code in item.split(",")
+            if language_code.strip()
+        ]
+
+    return CLIArguments(
+        urls=parsed_args.urls,
+        dsid=parsed_args.dsid,
+        catalog=parsed_args.catalog,
+        only_missing=parsed_args.only_missing,
+        batch=parsed_args.batch,
+        audit=parsed_args.audit,
+        languages=languages,
+    )
+
+
+def read_batch_urls(batch_file: Path) -> list[str]:
+    """
+    Read URLs from a batch file.
+    Blank lines and lines starting with '#' are skipped, and duplicate URLs are only kept once.
+
+    Args:
+        batch_file (Path): Path to the batch file.
+
+    Returns:
+        list[str]: The URLs listed in the batch file, in order of first appearance.
+    """
+    try:
+        lines = batch_file.read_text(encoding="utf-8").splitlines()
+
+    except OSError as e:
+        logger.error(f"Error reading batch file '{batch_file}': {e}")
+        logger.debug("Debug information:", exc_info=True)
+        raise SystemExit(1) from e
+
+    urls: list[str] = []
+    seen_urls: set[str] = set()
+
+    for line in lines:
+        url = line.strip()
+
+        if not url or url.startswith("#") or url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        urls.append(url)
+
+    return urls
 
 
 def format_cli_command_for_logging(cli_args: CLIArguments) -> str:
@@ -192,6 +300,18 @@ def format_cli_command_for_logging(cli_args: CLIArguments) -> str:
 
     if cli_args.catalog is not None:
         command_parts.extend(("--catalog", str(cli_args.catalog)))
+
+    if cli_args.only_missing:
+        command_parts.append("--only-missing")
+
+    if cli_args.batch is not None:
+        command_parts.extend(("--batch", str(cli_args.batch)))
+
+    if cli_args.audit:
+        command_parts.append("--audit")
+
+    if cli_args.languages is not None:
+        command_parts.extend(("--languages", *cli_args.languages))
 
     command_parts.extend(redact_url_query_param(url=url, key="dsid") for url in cli_args.urls)
     return " ".join(command_parts)

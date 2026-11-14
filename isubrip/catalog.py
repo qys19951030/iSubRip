@@ -460,3 +460,124 @@ class CatalogRecorder:
             return release_date.year
 
         return release_date
+
+
+_SUBTITLES_KIND_LABELS: tuple[tuple[CatalogSubtitlesKind, str], ...] = (
+    ("regular", "regular"),
+    ("cc", "CC"),
+    ("forced", "forced"),
+)
+
+
+def audit_catalog(catalog_path: str | Path, urls: Iterable[str], target_languages: Iterable[str]) -> bool:
+    """
+    Audit the catalog's subtitles coverage for the given source URLs, without any network access.
+    For each URL, prints the coverage of every target language (regular, CC and forced subtitles)
+    per media item found in the catalog, followed by a summary.
+
+    Args:
+        catalog_path (str | Path): Path to the subtitles catalog database file.
+        urls (Iterable[str]): Source URLs to audit (will be normalized and DSID-redacted).
+        target_languages (Iterable[str]): Language codes to check coverage for.
+
+    Returns:
+        bool: True if every target language is fully covered for every URL, False otherwise.
+    """
+    catalog_path = Path(catalog_path)
+    languages = list(target_languages)
+    urls = list(urls)
+    covered_count = 0
+    missing_count = 0
+
+    rows_by_url: dict[str, list[sqlite3.Row]] = {}
+
+    if catalog_path.is_file():
+        with SubtitlesCatalog(db_path=catalog_path) as catalog:
+            for url in urls:
+                rows_by_url[url] = catalog.get_source_rows(source_url=normalize_source_url(url=url))
+
+    else:
+        logger.warning(f"Subtitles catalog was not found at '{catalog_path}'. "
+                       f"Treating all subtitles as missing.")
+        rows_by_url = {url: [] for url in urls}
+
+    for url, rows in rows_by_url.items():
+        logger.info(f"[blue]{url}[/blue]")
+
+        if not rows:
+            logger.info("  No catalog records were found for this address.")
+
+        media_groups: dict[tuple, list[sqlite3.Row]] = {}
+
+        for row in rows:
+            media_key = (
+                row["itunes_id"],
+                row["media_type"],
+                row["title"],
+                row["season_number"],
+                row["episode_number"],
+            )
+            media_groups.setdefault(media_key, []).append(row)
+
+        if not media_groups:
+            # An address with no catalog records at all is treated as fully missing.
+            for language in languages:
+                missing_count += len(_SUBTITLES_KIND_LABELS)
+                logger.info(f"  {language}: {_format_missing_marks()}")
+
+            continue
+
+        for (itunes_id, media_type, title, season_number, episode_number), media_rows in media_groups.items():
+            media_header = _format_media_header(
+                media_type=media_type,
+                title=title,
+                rows=media_rows,
+                season_number=season_number,
+                episode_number=episode_number,
+                itunes_id=itunes_id,
+            )
+            logger.info(f"  {media_header}:")
+            present_keys = {(row["language_code"].casefold(), row["subtitles_type"]) for row in media_rows}
+
+            for language in languages:
+                marks = []
+
+                for kind, label in _SUBTITLES_KIND_LABELS:
+                    if (language.casefold(), kind) in present_keys:
+                        covered_count += 1
+                        marks.append(f"{label} ✓")
+
+                    else:
+                        missing_count += 1
+                        marks.append(f"{label} ✗")
+
+                logger.info(f"    {language}: {', '.join(marks)}")
+
+    logger.info(f"Audit summary: {covered_count} covered, {missing_count} missing "
+                f"across {len(urls)} address(es).")
+
+    return missing_count == 0
+
+
+def _format_missing_marks() -> str:
+    """Format an all-missing coverage marks string."""
+    return ", ".join(f"{label} ✗" for _, label in _SUBTITLES_KIND_LABELS)
+
+
+def _format_media_header(media_type: str, title: str, rows: list[sqlite3.Row],
+                         season_number: int | None, episode_number: int | None,
+                         itunes_id: str) -> str:
+    """Format a media description header for audit output."""
+    release_year = rows[0]["release_year"]
+    header = f"{media_type} '{title}'"
+
+    if release_year is not None:
+        header += f" [{release_year}]"
+
+    if season_number is not None and episode_number is not None:
+        header += f" S{season_number:02d}E{episode_number:02d}"
+
+    if itunes_id:
+        header += f" (iTunes ID: {itunes_id})"
+
+    return header
