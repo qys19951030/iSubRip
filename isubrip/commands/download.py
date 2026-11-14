@@ -483,7 +483,10 @@ async def download_subtitles(scraper: HLSScraper, media_data: Movie | Episode, d
                 progress_bar.update(task, visible=False)
 
         if not zip or len(temp_downloads) == 1:
-            for subtitles_data, file_path in zip(successful_downloads, temp_downloads, strict=True):
+            # 'successful_downloads' and 'temp_downloads' are appended to in pairs, so they are aligned.
+            # Note: 'zip' is shadowed by a parameter name in this scope, so indexing is used instead.
+            for index, file_path in enumerate(temp_downloads):
+                subtitles_data = successful_downloads[index]
                 if overwrite_existing:
                     new_path = download_path / file_path.name
 
